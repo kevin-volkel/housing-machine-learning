@@ -1,4 +1,3 @@
-import argparse
 import pickle
 from pathlib import Path
 from typing import cast
@@ -100,12 +99,7 @@ def _prepare_features(df: pd.DataFrame, target_col: str, month_col: str | None, 
 
 def main() -> None:
     """Train and save a RandomForest pipeline for median sale price prediction."""
-    parser = argparse.ArgumentParser(description="Train a Redfin median sale price prediction model.")
-    parser.add_argument("--data", default="redfin_data.csv", help="Path to Redfin CSV/Excel file.")
-    parser.add_argument("--model-out", default="redfin_median_sale_price_model.pkl", help="Path to save trained model pipeline.")
-    args = parser.parse_args()
-
-    data_path = Path(args.data)
+    data_path = Path("redfin_data.xlsx")
     if not data_path.exists():
         raise FileNotFoundError(f"Data file not found: {data_path}")
 
@@ -189,7 +183,8 @@ def main() -> None:
     print(f"R²: {r2:.4f}")
 
     # Persist trained pipeline and metadata for later inference use.
-    with open(args.model_out, "wb") as file:
+    model_output_path = Path("redfin_median_sale_price_model.pkl")
+    with open(model_output_path, "wb") as file:
         pickle.dump(
             {
                 "pipeline": pipeline,
@@ -199,7 +194,7 @@ def main() -> None:
             file,
         )
 
-    print(f"Saved model pipeline to: {args.model_out}")
+    print(f"Saved model pipeline to: {model_output_path}")
 
 
 if __name__ == "__main__":
