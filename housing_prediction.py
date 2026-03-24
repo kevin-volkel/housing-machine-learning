@@ -1,4 +1,5 @@
 import pickle
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -7,10 +8,36 @@ from pandas.api.types import is_numeric_dtype
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_absolute_percentage_error,
+    mean_squared_error,
+    r2_score,
+)
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
+
+
+MODEL_QUALITY_THRESHOLDS = {
+    "mape": 0.10,
+    "r2": 0.80,
+}
+
+
+@dataclass(frozen=True)
+class TrainingResult:
+    """Container for a trained model pipeline and evaluation outputs."""
+
+    pipeline: Pipeline
+    target_column: str
+    feature_columns: list[str]
+    metrics: dict[str, float]
+    row_count: int
+    feature_count: int
+    X_test: pd.DataFrame
+    y_test: pd.Series
+    predictions: pd.Series
 
 
 def _read_redfin_data(data_path: Path) -> pd.DataFrame:
@@ -34,9 +61,9 @@ def _find_column(columns: list[str], preferred: str, contains_all: list[str]) ->
 
 
 def _parse_numeric_column(series: pd.Series) -> pd.Series:
-    """Convert currency/percent-like text values into numeric values."""
+    """Convert currency and percent-like text values into numeric values."""
     text_values = series.astype(str).str.strip()
-    has_percent = text_values.str.contains("%", na=False).mean() > 0.2
+    percent_mask = text_values.str.contains("%", na=False)
 
     cleaned = (
         text_values
@@ -45,23 +72,23 @@ def _parse_numeric_column(series: pd.Series) -> pd.Series:
         .str.replace("%", "", regex=False)
     )
     numeric = cast(pd.Series, pd.to_numeric(cleaned, errors="coerce"))
-
-    if has_percent:
-        numeric = numeric / 100.0
-    return numeric
+    return cast(pd.Series, numeric.where(~percent_mask, numeric / 100.0))
 
 
-def _prepare_features(df: pd.DataFrame, target_col: str, month_col: str | None, region_col: str | None) -> tuple[pd.DataFrame, pd.Series]:
+def _prepare_features(
+    df: pd.DataFrame,
+    target_col: str,
+    month_col: str | None,
+    region_col: str | None,
+) -> tuple[pd.DataFrame, pd.Series]:
     """Build model features and cleaned target vector from raw Redfin data."""
     df = df.copy()
     df.columns = [str(col).strip() for col in df.columns]
 
-    # Parse target as numeric price values.
     y = _parse_numeric_column(df[target_col])
 
     feature_df = pd.DataFrame(index=df.index)
 
-    # Derive temporal features from month/date values when available.
     if month_col is not None and month_col in df.columns:
         month_series = pd.Series(pd.to_datetime(df[month_col], format="%B %Y", errors="coerce"), index=df.index)
         if month_series.isna().all():
@@ -69,11 +96,9 @@ def _prepare_features(df: pd.DataFrame, target_col: str, month_col: str | None, 
         feature_df["year"] = month_series.dt.year
         feature_df["month"] = month_series.dt.month
 
-    # Preserve region as a categorical feature.
     if region_col is not None and region_col in df.columns:
         feature_df["region"] = df[region_col].astype(str).str.strip()
 
-    # Attempt to parse remaining usable columns as numeric predictors.
     for col in df.columns:
         col_lower = col.lower()
         if col == target_col:
@@ -97,13 +122,8 @@ def _prepare_features(df: pd.DataFrame, target_col: str, month_col: str | None, 
     return model_df, y_clean
 
 
-def main() -> None:
-    """Train and save a RandomForest pipeline for median sale price prediction."""
-    data_path = Path("redfin_data.xlsx")
-    if not data_path.exists():
-        raise FileNotFoundError(f"Data file not found: {data_path}")
-
-    df = _read_redfin_data(data_path)
+def _detect_columns(df: pd.DataFrame) -> tuple[str, str | None, str | None]:
+    """Infer target, month, and region columns from the Redfin dataset."""
     df.columns = [str(col).strip() for col in df.columns]
 
     target_col = _find_column(
@@ -127,17 +147,14 @@ def main() -> None:
         preferred="Region",
         contains_all=["region"],
     )
+    return str(target_col), month_col, region_col
 
-    X, y = _prepare_features(df, target_col=str(target_col), month_col=month_col, region_col=region_col)
 
-    if X.empty:
-        raise ValueError("No usable features were found after preprocessing.")
-
-    # Split features into numeric and categorical groups for preprocessing.
+def _build_pipeline(X: pd.DataFrame, *, random_state: int = 42, n_estimators: int = 400) -> Pipeline:
+    """Build the preprocessing and RandomForest training pipeline."""
     numeric_features = [col for col in X.columns if is_numeric_dtype(X[col])]
     categorical_features = [col for col in X.columns if col not in numeric_features]
 
-    # Build preprocessing pipeline: impute missing values, then one-hot encode categoricals.
     preprocessor = ColumnTransformer(
         transformers=[
             ("numeric", Pipeline(steps=[("imputer", SimpleImputer(strategy="median"))]), numeric_features),
@@ -154,47 +171,147 @@ def main() -> None:
         ],
     )
 
-    # Train a tree-based regressor on preprocessed feature matrix.
-    model = RandomForestRegressor(n_estimators=400, random_state=42, n_jobs=-1)
-
-    pipeline = Pipeline(
+    model = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state, n_jobs=-1)
+    return Pipeline(
         steps=[
             ("preprocessor", preprocessor),
             ("model", model),
         ]
     )
 
-    # Hold out a test split for basic evaluation metrics.
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+def _calculate_metrics(y_true: pd.Series, y_pred: pd.Series) -> dict[str, float]:
+    """Compute the regression metrics tracked for model quality."""
+    return {
+        "mae": mean_absolute_error(y_true, y_pred),
+        "rmse": mean_squared_error(y_true, y_pred) ** 0.5,
+        "mape": mean_absolute_percentage_error(y_true, y_pred),
+        "r2": r2_score(y_true, y_pred),
+    }
+
+
+def _format_metric_value(metric_name: str, value: float) -> str:
+    """Render a metric value in a readable format."""
+    if metric_name in {"mae", "rmse"}:
+        return f"${value:,.2f}"
+    if metric_name == "mape":
+        return f"{value:.2%}"
+    return f"{value:.4f}"
+
+
+def format_metrics_report(
+    metrics: dict[str, float],
+    metric_thresholds: dict[str, float] | None = None,
+) -> str:
+    """Create a readable multi-line report for model metrics."""
+    threshold_rules = {
+        "mape": ("<", lambda actual, target: actual < target),
+        "r2": (">", lambda actual, target: actual > target),
+    }
+
+    lines = [
+        "Metrics",
+        "-------",
+    ]
+    for metric_name in ("mae", "rmse", "mape", "r2"):
+        value = metrics[metric_name]
+        line = f"{metric_name.upper():<5}: {_format_metric_value(metric_name, value)}"
+        if metric_thresholds and metric_name in metric_thresholds:
+            target = metric_thresholds[metric_name]
+            symbol, comparator = threshold_rules[metric_name]
+            status = "PASS" if comparator(value, target) else "FAIL"
+            line += f"  |  target {symbol} {_format_metric_value(metric_name, target)}  |  {status}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def format_training_summary(
+    result: TrainingResult,
+    metric_thresholds: dict[str, float] | None = None,
+) -> str:
+    """Create a readable summary of the training run."""
+    return "\n".join(
+        [
+            "Training Summary",
+            "----------------",
+            f"Target column : {result.target_column}",
+            f"Rows used     : {result.row_count:,}",
+            f"Features used : {result.feature_count}",
+            "",
+            format_metrics_report(result.metrics, metric_thresholds),
+        ]
+    )
+
+
+def train_model(
+    data_path: Path = Path("redfin_data.xlsx"),
+    *,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    n_estimators: int = 400,
+) -> TrainingResult:
+    """Train the median sale price model and return evaluation details."""
+    if not data_path.exists():
+        raise FileNotFoundError(f"Data file not found: {data_path}")
+
+    df = _read_redfin_data(data_path)
+    target_col, month_col, region_col = _detect_columns(df)
+    X, y = _prepare_features(df, target_col=target_col, month_col=month_col, region_col=region_col)
+
+    if X.empty:
+        raise ValueError("No usable features were found after preprocessing.")
+
+    pipeline = _build_pipeline(X, random_state=random_state, n_estimators=n_estimators)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=test_size,
+        random_state=random_state,
+    )
 
     pipeline.fit(X_train, y_train)
-    y_pred = pipeline.predict(X_test)
+    predictions = pd.Series(pipeline.predict(X_test), index=y_test.index, name="prediction")
+    metrics = _calculate_metrics(y_test, predictions)
 
-    # Report common regression metrics.
-    mae = mean_absolute_error(y_test, y_pred)
-    rmse = mean_squared_error(y_test, y_pred) ** 0.5
-    r2 = r2_score(y_test, y_pred)
+    return TrainingResult(
+        pipeline=pipeline,
+        target_column=target_col,
+        feature_columns=X.columns.tolist(),
+        metrics=metrics,
+        row_count=len(X),
+        feature_count=X.shape[1],
+        X_test=X_test,
+        y_test=y_test,
+        predictions=predictions,
+    )
 
-    print(f"Target column: {target_col}")
-    print(f"Rows used: {len(X):,}")
-    print(f"Features used: {X.shape[1]}")
-    print(f"MAE: ${mae:,.2f}")
-    print(f"RMSE: ${rmse:,.2f}")
-    print(f"R²: {r2:.4f}")
 
-    # Persist trained pipeline and metadata for later inference use.
-    model_output_path = Path("redfin_median_sale_price_model.pkl")
+def save_model_artifact(
+    result: TrainingResult,
+    model_output_path: Path = Path("redfin_median_sale_price_model.pkl"),
+) -> None:
+    """Persist the trained pipeline and metadata for later inference use."""
     with open(model_output_path, "wb") as file:
         pickle.dump(
             {
-                "pipeline": pipeline,
-                "target_column": target_col,
-                "feature_columns": X.columns.tolist(),
+                "pipeline": result.pipeline,
+                "target_column": result.target_column,
+                "feature_columns": result.feature_columns,
+                "metrics": result.metrics,
             },
             file,
         )
 
-    print(f"Saved model pipeline to: {model_output_path}")
+
+def main() -> None:
+    """Train and save a RandomForest pipeline for median sale price prediction."""
+    result = train_model()
+    model_output_path = Path("redfin_median_sale_price_model.pkl")
+    save_model_artifact(result, model_output_path)
+
+    print(format_training_summary(result, MODEL_QUALITY_THRESHOLDS))
+    print(f"\nSaved model pipeline to: {model_output_path}")
 
 
 if __name__ == "__main__":
