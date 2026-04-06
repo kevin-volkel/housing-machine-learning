@@ -6,7 +6,7 @@ import {
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const API = "http://localhost:8000";
+const API = "";
 
 const MONTHS = [
   "January","February","March","April","May","June",
