@@ -13,11 +13,6 @@ const MONTHS = [
   "July","August","September","October","November","December",
 ];
 
-const KNOWN_REGIONS = [
-  "Phoenix, AZ","Tucson, AZ","Scottsdale, AZ","Mesa, AZ",
-  "Tempe, AZ","Chandler, AZ","Gilbert, AZ","Glendale, AZ",
-  "United States","National",
-];
 
 // ─── Styles ──────────────────────────────────────────────────────────────────
 
@@ -316,6 +311,7 @@ export default function App() {
         const data = await res.json();
         setModelInfo(data);
         setApiStatus("online");
+        setRegion((current) => current || data.default_region || "");
 
         // Seed extra fields from feature_columns (exclude year/month/region)
         const coreKeys = new Set(["year", "month", "region"]);
@@ -372,6 +368,10 @@ export default function App() {
   // ── Render ────────────────────────────────────────────────────────────────
 
   const metrics = modelInfo?.metrics;
+  const supportedRegions = modelInfo?.regions || [];
+  const regionPlaceholder = modelInfo?.default_region
+    ? `e.g. ${modelInfo.default_region}`
+    : "Loading supported regions...";
   const extraKeys = Object.keys(extraFields);
 
   return (
@@ -444,10 +444,10 @@ export default function App() {
                   list="region-list"
                   value={region}
                   onChange={(e) => setRegion(e.target.value)}
-                  placeholder="e.g. Phoenix, AZ"
+                  placeholder={regionPlaceholder}
                 />
                 <datalist id="region-list">
-                  {KNOWN_REGIONS.map((r) => <option key={r} value={r} />)}
+                  {supportedRegions.map((r) => <option key={r} value={r} />)}
                 </datalist>
               </div>
 
