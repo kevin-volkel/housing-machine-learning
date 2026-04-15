@@ -1,15 +1,17 @@
-import pickle
 from pathlib import Path
+from typing import Any
 
-import pandas as pd
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-MODEL_PATH = Path("redfin_median_sale_price_model.pkl")
+from housing_prediction import DEFAULT_MODEL_OUTPUT_PATH, load_model_artifact, predict_from_artifact
 
-app = FastAPI(title="Housing Prediction API", version="1.0.0")
+
+MODEL_PATH = Path(DEFAULT_MODEL_OUTPUT_PATH)
+
+app = FastAPI(title="Housing Prediction API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,42 +25,52 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load model once at startup
-artifact: dict = {}
+artifact: dict[str, Any] = {}
 
 
 @app.on_event("startup")
 def load_model() -> None:
     if not MODEL_PATH.exists():
         raise RuntimeError(f"Model file not found: {MODEL_PATH}")
-    with open(MODEL_PATH, "rb") as f:
-        artifact.update(pickle.load(f))
-    print(f"Model loaded — target: {artifact['target_column']}")
+
+    artifact.clear()
+    artifact.update(load_model_artifact(MODEL_PATH))
+    print(f"Model loaded - type: {artifact['model_type']}")
+    print(f"Regions: {artifact['regions']}")
     print(f"Features: {artifact['feature_columns']}")
 
 
 class PredictionRequest(BaseModel):
-    features: dict[str, float | str]
+    features: dict[str, float | str | None]
 
 
 class PredictionResponse(BaseModel):
     predicted_median_sale_price: float
     formatted: str
+    region_used: str
+    prediction_mode: str
 
 
 @app.get("/health")
-def health() -> dict:
+def health() -> dict[str, Any]:
     return {"status": "ok", "model_loaded": bool(artifact)}
 
 
 @app.get("/model-info")
-def model_info() -> dict:
+def model_info() -> dict[str, Any]:
     if not artifact:
         raise HTTPException(status_code=503, detail="Model not loaded")
+
     return {
+        "model_type": artifact["model_type"],
         "target_column": artifact["target_column"],
         "feature_columns": artifact["feature_columns"],
         "metrics": artifact["metrics"],
+        "regions": artifact["regions"],
+        "default_region": artifact["default_region"],
+        "forecast_horizon": artifact["forecast_horizon"],
+        "training_start_by_region": artifact["training_start_by_region"],
+        "training_end_by_region": artifact["training_end_by_region"],
     }
 
 
@@ -67,22 +79,14 @@ def predict(request: PredictionRequest) -> PredictionResponse:
     if not artifact:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    pipeline = artifact["pipeline"]
-    feature_columns = artifact["feature_columns"]
-
-    # Build input row aligned to trained feature columns
-    row = {col: request.features.get(col, None) for col in feature_columns}
-    X = pd.DataFrame([row])
-
     try:
-        prediction = float(pipeline.predict(X)[0])
+        prediction = predict_from_artifact(artifact, request.features)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Prediction failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}") from exc
 
-    return PredictionResponse(
-        predicted_median_sale_price=round(prediction, 2),
-        formatted=f"${prediction:,.0f}",
-    )
+    return PredictionResponse(**prediction)
 
 
 if __name__ == "__main__":

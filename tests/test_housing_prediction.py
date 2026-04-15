@@ -1,3 +1,4 @@
+import importlib.util
 import pickle
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ import housing_prediction as hp
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_PATH = PROJECT_ROOT / "redfin_data.xlsx"
+HAS_OPENPYXL = importlib.util.find_spec("openpyxl") is not None
 
 
 class ParseNumericColumnTests(unittest.TestCase):
@@ -24,44 +26,59 @@ class ParseNumericColumnTests(unittest.TestCase):
         self.assertTrue(pd.isna(parsed.iloc[3]))
 
 
-class PrepareFeaturesTests(unittest.TestCase):
-    def test_prepare_features_extracts_expected_model_inputs(self) -> None:
+class PrepareForecastingPanelTests(unittest.TestCase):
+    def test_prepare_forecasting_panel_forward_fills_region_and_selects_exogenous_inputs(self) -> None:
         df = pd.DataFrame(
             {
-                "Month of Period End": ["January 2024", "February 2024"],
-                "Region": ["Phoenix", "Tucson"],
-                "Median Sale Price": ["$423,000", "$350,000"],
-                "Homes Sold": ["250", "175"],
-                "Inventory YoY": ["5.0%", "10.0%"],
-                "Other Sale Price Signal": ["$410,000", "$340,000"],
+                "Region": ["National", None, "Boston, MA metro area", None],
+                "Month of Period End": ["January 2024", "February 2024", "January 2024", "February 2024"],
+                "Median Sale Price": ["$400,000", "$405,000", "$600,000", "$606,000"],
+                "Homes Sold": ["200", "210", "100", "105"],
+                "New Listings": ["300", "320", "140", "145"],
+                "Inventory": ["500", "510", "220", "225"],
+                "Days on Market": ["40", "38", "25", "24"],
+                "Average Sale To List": ["99.1%", "99.4%", "101.2%", "101.0%"],
             }
         )
 
-        X, y = hp._prepare_features(
+        panel, exogenous_features = hp._prepare_forecasting_panel(
             df,
             target_col="Median Sale Price",
             month_col="Month of Period End",
             region_col="Region",
         )
 
-        self.assertListEqual(X.columns.tolist(), ["year", "month", "region", "Homes Sold", "Inventory YoY"])
-        self.assertEqual(X.loc[0, "year"], 2024.0)
-        self.assertEqual(X.loc[0, "month"], 1.0)
-        self.assertEqual(X.loc[0, "region"], "Phoenix")
-        self.assertEqual(X.loc[0, "Homes Sold"], 250.0)
-        self.assertAlmostEqual(X.loc[0, "Inventory YoY"], 0.05)
-        self.assertListEqual(y.tolist(), [423000.0, 350000.0])
+        self.assertListEqual(
+            exogenous_features,
+            ["Homes Sold", "New Listings", "Inventory", "Days on Market", "Average Sale To List"],
+        )
+        self.assertListEqual(
+            panel["region"].tolist(),
+            ["Boston, MA metro area", "Boston, MA metro area", "National", "National"],
+        )
+        self.assertListEqual(
+            panel["period"].dt.strftime("%Y-%m-%d").tolist(),
+            ["2024-01-01", "2024-02-01", "2024-01-01", "2024-02-01"],
+        )
+        self.assertListEqual(
+            panel["target"].tolist(),
+            [600000.0, 606000.0, 400000.0, 405000.0],
+        )
+        self.assertAlmostEqual(panel.iloc[0]["Average Sale To List"], 1.012)
 
 
-class TrainingPipelineTests(unittest.TestCase):
+class ForecastTrainingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.result = hp.train_model(DATA_PATH)
+        if not HAS_OPENPYXL:
+            raise unittest.SkipTest("openpyxl is required for the Excel-backed training tests.")
 
-    @classmethod
-    def tearDownClass(cls) -> None:
-        print()
-        print(hp.format_training_summary(cls.result, hp.MODEL_QUALITY_THRESHOLDS))
+        cls.result = hp.train_model(DATA_PATH)
+        with TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "model.pkl"
+            hp.save_model_artifact(cls.result, model_path)
+            with open(model_path, "rb") as file:
+                cls.artifact = pickle.load(file)
 
     def test_model_quality_meets_thresholds(self) -> None:
         self.assertLess(
@@ -75,33 +92,67 @@ class TrainingPipelineTests(unittest.TestCase):
             f"Expected R2 > 0.80, got {self.result.metrics['r2']:.4f}.",
         )
 
-    def test_saved_artifact_can_predict_on_holdout_rows(self) -> None:
-        with TemporaryDirectory() as temp_dir:
-            model_path = Path(temp_dir) / "model.pkl"
-            hp.save_model_artifact(self.result, model_path)
-
-            with open(model_path, "rb") as file:
-                artifact = pickle.load(file)
-
-        self.assertSetEqual(
-            set(artifact.keys()),
-            {"pipeline", "target_column", "feature_columns", "metrics"},
+    def test_training_result_captures_regions_and_selected_features(self) -> None:
+        self.assertGreaterEqual(len(self.result.regions), 5)
+        self.assertEqual(self.result.feature_columns[:3], ["year", "month", "region"])
+        self.assertListEqual(
+            self.result.feature_columns[3:],
+            ["Homes Sold", "New Listings", "Inventory", "Days on Market", "Average Sale To List"],
         )
-        self.assertEqual(artifact["target_column"], self.result.target_column)
-        self.assertListEqual(artifact["feature_columns"], self.result.feature_columns)
+        self.assertEqual(self.result.forecast_horizon, 12)
 
-        sample = self.result.X_test.head(5)
-        predictions = artifact["pipeline"].predict(sample)
-        self.assertEqual(len(predictions), len(sample))
-        self.assertTrue(pd.notna(predictions).all())
+    def test_saved_artifact_can_predict_above_the_training_year(self) -> None:
+        prediction_2026 = hp.predict_from_artifact(
+            self.artifact,
+            {"year": 2026, "month": 4, "region": "National"},
+        )
+        prediction_2028 = hp.predict_from_artifact(
+            self.artifact,
+            {"year": 2028, "month": 4, "region": "National"},
+        )
+        prediction_2030 = hp.predict_from_artifact(
+            self.artifact,
+            {"year": 2030, "month": 4, "region": "National"},
+        )
 
-    def test_format_training_summary_includes_metrics_and_threshold_status(self) -> None:
+        self.assertNotEqual(
+            prediction_2026["predicted_median_sale_price"],
+            prediction_2028["predicted_median_sale_price"],
+        )
+        self.assertNotEqual(
+            prediction_2028["predicted_median_sale_price"],
+            prediction_2030["predicted_median_sale_price"],
+        )
+        self.assertEqual(prediction_2030["prediction_mode"], "forecast")
+
+    def test_artifact_uses_default_region_aliases_and_optional_exogenous_overrides(self) -> None:
+        default_prediction = hp.predict_from_artifact(
+            self.artifact,
+            {"year": 2027, "month": 4, "region": "United States"},
+        )
+        stressed_prediction = hp.predict_from_artifact(
+            self.artifact,
+            {
+                "year": 2027,
+                "month": 4,
+                "region": "United States",
+                "Inventory": 1_000_000,
+                "Days on Market": 70,
+            },
+        )
+
+        self.assertEqual(default_prediction["region_used"], "National")
+        self.assertNotEqual(
+            default_prediction["predicted_median_sale_price"],
+            stressed_prediction["predicted_median_sale_price"],
+        )
+
+    def test_format_training_summary_includes_holdout_details_and_pass_status(self) -> None:
         summary = hp.format_training_summary(self.result, hp.MODEL_QUALITY_THRESHOLDS)
 
         self.assertIn("Training Summary", summary)
+        self.assertIn("Holdout", summary)
         self.assertIn("Metrics", summary)
-        self.assertIn("MAPE", summary)
-        self.assertIn("R2", summary)
         self.assertIn("PASS", summary)
 
 

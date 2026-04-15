@@ -1,11 +1,11 @@
 ﻿# housing-machine-learning
 
-Train a machine learning model to predict Redfin median sale prices from a CSV or Excel dataset.
+Train and serve a forecasting model for Redfin median sale prices from a CSV or Excel dataset.
 
 ## Requirements
 
 - Python 3.12+
-- Packages: `pandas`, `scikit-learn`, `openpyxl` (for Excel files)
+- Packages: `pandas`, `scikit-learn`, `statsmodels`, `openpyxl`, `fastapi`, `uvicorn`
 
 ## Setup
 
@@ -14,7 +14,7 @@ Train a machine learning model to predict Redfin median sale prices from a CSV o
 ```powershell
 python -m venv housing_venv
 .\housing_venv\Scripts\Activate.ps1
-pip install pandas scikit-learn openpyxl
+pip install pandas scikit-learn statsmodels openpyxl fastapi uvicorn
 ```
 
 ## Input data
@@ -28,24 +28,24 @@ pip install pandas scikit-learn openpyxl
 
 ## Run
 
-As of Sprint 5 running is completed by entering http://18.188.142.26 into any browser.
-
-Use defaults (`redfin_data.csv` input and `redfin_median_sale_price_model.pkl` output):
+Train and save the SARIMAX forecasting artifact:
 
 ```powershell
 python .\housing_prediction.py
 ```
 
-Specify custom input/output paths:
+Start the API locally:
 
 ```powershell
-python .\housing_prediction.py --data .\your_file.xlsx --model-out .\my_model.pkl
+python .\api.py
 ```
 
 ## Output
 
-The script prints model metrics (MAE, RMSE, and R²) and saves a pickle file containing:
+The training script prints chronological holdout metrics and saves a pickle file containing:
 
-- trained preprocessing + model pipeline
+- trained per-region SARIMAX models
 - detected target column name
 - feature column list
+- supported regions
+- default exogenous values used for future forecasts
