@@ -373,6 +373,7 @@ export default function App() {
     ? `e.g. ${modelInfo.default_region}`
     : "Loading supported regions...";
   const extraKeys = Object.keys(extraFields);
+  const modelLabel = (modelInfo?.model_type || "sarimax").toUpperCase();
 
   return (
     <>
@@ -383,7 +384,7 @@ export default function App() {
         <div className="header">
           <div className="header-left">
             <h1>Housing<span>Price</span></h1>
-            <p>Redfin · RandomForest · Median Sale Price</p>
+            <p>{`Redfin | ${modelLabel} | Median Sale Price`}</p>
           </div>
           <div className="status-pill">
             <div className={`status-dot ${apiStatus === "online" ? "online" : apiStatus === "error" ? "error" : ""}`} />
