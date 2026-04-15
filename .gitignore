@@ -9,3 +9,4 @@ backend-dev.out.log
 backend-dev.err.log
 frontend/frontend-dev.out.log
 frontend/frontend-dev.err.log
+*.pkl
